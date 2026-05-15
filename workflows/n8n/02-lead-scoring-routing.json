@@ -1,1 +1,169 @@
-{}
+{
+  "name": "Lead Scoring & Smart Routing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "clay-enriched-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-clay",
+      "name": "Webhook: Clay Enrichment Complete",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "clay-enriched-lead",
+      "notes": "Receives enriched account data from Clay after waterfall enrichment completes. Payload includes firmographics, technographics, contacts, and pain indicators."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ICP Scoring Model for Interactly.AI Healthcare GTM\n// Weights calibrated for healthcare admin automation buyer\n\nconst lead = $input.first().json;\n\nlet score = 0;\nconst breakdown = {};\n\n// --- ORGANIZATION SIZE (20 points max) ---\nconst providers = parseInt(lead.num_providers) || 0;\nif (providers >= 10 && providers <= 200) {\n  breakdown.org_size = 20;\n} else if (providers >= 5 && providers < 10) {\n  breakdown.org_size = 12;\n} else if (providers > 200) {\n  breakdown.org_size = 15; // large but slower sales cycle\n} else {\n  breakdown.org_size = 5;\n}\n\n// --- SPECIALTY MATCH (15 points max) ---\nconst highAdminSpecialties = ['radiology', 'cardiology', 'orthopedics', 'oncology', 'gastroenterology'];\nconst specialty = (lead.specialty || '').toLowerCase();\nif (highAdminSpecialties.some(s => specialty.includes(s))) {\n  breakdown.specialty = 15; // high prior-auth burden specialties\n} else if (specialty.includes('primary') || specialty.includes('family') || specialty.includes('internal')) {\n  breakdown.specialty = 10; // high volume, moderate complexity\n} else if (specialty.includes('urgent') || specialty.includes('multi')) {\n  breakdown.specialty = 12;\n} else {\n  breakdown.specialty = 6;\n}\n\n// --- EHR VENDOR (10 points max) ---\nconst ehr = (lead.ehr_vendor || '').toLowerCase();\nif (ehr.includes('epic') || ehr.includes('cerner')) {\n  breakdown.ehr = 10; // legacy, integration-ready, high admin burden\n} else if (ehr.includes('athena') || ehr.includes('eclinical') || ehr.includes('nextgen')) {\n  breakdown.ehr = 8;\n} else if (ehr.includes('allscripts') || ehr.includes('meditech')) {\n  breakdown.ehr = 7;\n} else {\n  breakdown.ehr = 4;\n}\n\n// --- PAIN SIGNAL STRENGTH (25 points max) ---\nlet painScore = 0;\nconst signals = lead.pain_signals || [];\nif (signals.includes('job_posting_admin')) painScore += 8;\nif (signals.includes('negative_reviews')) painScore += 6;\nif (signals.includes('high_denial_rate')) painScore += 7;\nif (signals.includes('staff_turnover')) painScore += 4;\nbreakdown.pain = Math.min(painScore, 25);\n\n// --- INTENT SIGNAL RECENCY (20 points max) ---\nconst daysSinceSignal = parseInt(lead.days_since_signal) || 999;\nif (daysSinceSignal <= 7) {\n  breakdown.recency = 20;\n} else if (daysSinceSignal <= 30) {\n  breakdown.recency = 12;\n} else if (daysSinceSignal <= 90) {\n  breakdown.recency = 5;\n} else {\n  breakdown.recency = 0;\n}\n\n// --- GEOGRAPHIC FIT (10 points max) ---\nconst highDensityStates = ['CA', 'TX', 'FL', 'NY', 'PA', 'IL', 'OH', 'GA', 'NC', 'MI'];\nconst state = (lead.state || '').toUpperCase();\nbreakdown.geo = highDensityStates.includes(state) ? 10 : 5;\n\n// --- CALCULATE TOTAL ---\nscore = Object.values(breakdown).reduce((a, b) => a + b, 0);\n\n// --- DETERMINE TIER ---\nlet tier, action;\nif (score >= 80) {\n  tier = 'HOT';\n  action = 'priority_sequence';\n} else if (score >= 50) {\n  tier = 'WARM';\n  action = 'nurture_sequence';\n} else if (score >= 20) {\n  tier = 'COOL';\n  action = 'monthly_drip';\n} else {\n  tier = 'COLD';\n  action = 'archive';\n}\n\nreturn [{\n  json: {\n    ...lead,\n    icp_score: score,\n    icp_tier: tier,\n    icp_action: action,\n    score_breakdown: breakdown,\n    scored_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "score-lead",
+      "name": "ICP Scoring Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "notes": "Composite scoring model (0-100): Org Size (20), Specialty Match (15), EHR Vendor (10), Pain Signals (25), Intent Recency (20), Geographic Fit (10). Routes to HOT/WARM/COOL/COLD tiers."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            {
+              "outputIndex": 0,
+              "conditions": {
+                "conditions": [{ "leftValue": "={{ $json.icp_tier }}", "rightValue": "HOT", "operator": { "type": "string", "operation": "equals" } }]
+              }
+            },
+            {
+              "outputIndex": 1,
+              "conditions": {
+                "conditions": [{ "leftValue": "={{ $json.icp_tier }}", "rightValue": "WARM", "operator": { "type": "string", "operation": "equals" } }]
+              }
+            },
+            {
+              "outputIndex": 2,
+              "conditions": {
+                "conditions": [{ "leftValue": "={{ $json.icp_tier }}", "rightValue": "COOL", "operator": { "type": "string", "operation": "equals" } }]
+              }
+            }
+          ],
+          "fallbackOutput": 3
+        }
+      },
+      "id": "route-switch",
+      "name": "Route by Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [740, 300],
+      "notes": "4-way routing: HOT → Priority SDR queue + immediate sequence | WARM → 14-day nurture | COOL → Monthly drip | COLD → Archive"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://server.smartlead.ai/api/v1/campaigns/{{ $env.SMARTLEAD_HOT_CAMPAIGN }}/leads",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.SMARTLEAD_API_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"email\": \"{{ $json.contact_email }}\",\n  \"first_name\": \"{{ $json.contact_first_name }}\",\n  \"last_name\": \"{{ $json.contact_last_name }}\",\n  \"company_name\": \"{{ $json.org_name }}\",\n  \"custom_fields\": {\n    \"role\": \"{{ $json.contact_role }}\",\n    \"specialty\": \"{{ $json.specialty }}\",\n    \"signal_type\": \"{{ $json.signal_type }}\",\n    \"icp_score\": \"{{ $json.icp_score }}\",\n    \"pain_signals\": \"{{ $json.pain_signals }}\",\n    \"ehr_vendor\": \"{{ $json.ehr_vendor }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "smartlead-hot",
+      "name": "Smartlead: Priority Sequence (HOT)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 120],
+      "notes": "Enrolls HOT leads (score 80+) into high-priority multi-step email campaign. Custom fields enable AI personalization via Smartlead's variable system."
+    },
+    {
+      "parameters": {
+        "resource": "channel",
+        "operation": "post",
+        "channel": { "__rl": true, "value": "{{ $env.SLACK_HOT_LEADS }}", "mode": "id" },
+        "text": ":fire: *HOT LEAD — Score {{ $json.icp_score }}/100*\n\n*Org:* {{ $json.org_name }}\n*Contact:* {{ $json.contact_first_name }} {{ $json.contact_last_name }} ({{ $json.contact_role }})\n*Signal:* {{ $json.signal_type }} — {{ $json.headline }}\n*Specialty:* {{ $json.specialty }} | *Providers:* {{ $json.num_providers }}\n*Score Breakdown:* {{ JSON.stringify($json.score_breakdown) }}\n\n:point_right: Auto-enrolled in priority sequence. Follow up within 24h.",
+        "otherOptions": {}
+      },
+      "id": "slack-hot-alert",
+      "name": "Slack: HOT Lead Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1000, 0],
+      "notes": "Immediate Slack alert for founder/SDR when a high-score lead enters the pipeline"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.HUBSPOT_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"email\": \"{{ $json.contact_email }}\",\n    \"firstname\": \"{{ $json.contact_first_name }}\",\n    \"lastname\": \"{{ $json.contact_last_name }}\",\n    \"company\": \"{{ $json.org_name }}\",\n    \"jobtitle\": \"{{ $json.contact_role }}\",\n    \"icp_score\": \"{{ $json.icp_score }}\",\n    \"icp_tier\": \"{{ $json.icp_tier }}\",\n    \"signal_type\": \"{{ $json.signal_type }}\",\n    \"lifecyclestage\": \"lead\"\n  }\n}",
+        "options": {}
+      },
+      "id": "hubspot-warm",
+      "name": "HubSpot: Create Contact (WARM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 300],
+      "notes": "Creates contact in HubSpot with ICP metadata for WARM leads. Enrolls in 14-day nurture workflow via HubSpot automation."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "{{ $env.GSHEET_SIGNAL_LOG }}", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Scored Leads", "mode": "name" },
+        "columns": { "mappingMode": "autoMapInputData" },
+        "options": {}
+      },
+      "id": "gsheet-cool",
+      "name": "Google Sheets: Archive (COOL/COLD)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1000, 480],
+      "notes": "Low-score leads logged to Google Sheets for monthly review. Re-evaluated if new signals fire."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'processed', score: $json.icp_score, tier: $json.icp_tier }) }}"
+      },
+      "id": "respond-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1200, 600]
+    }
+  ],
+  "connections": {
+    "Webhook: Clay Enrichment Complete": {
+      "main": [[ { "node": "ICP Scoring Engine", "type": "main", "index": 0 } ]]
+    },
+    "ICP Scoring Engine": {
+      "main": [[ { "node": "Route by Tier", "type": "main", "index": 0 } ]]
+    },
+    "Route by Tier": {
+      "main": [
+        [ { "node": "Smartlead: Priority Sequence (HOT)", "type": "main", "index": 0 }, { "node": "Slack: HOT Lead Alert", "type": "main", "index": 0 } ],
+        [ { "node": "HubSpot: Create Contact (WARM)", "type": "main", "index": 0 } ],
+        [ { "node": "Google Sheets: Archive (COOL/COLD)", "type": "main", "index": 0 } ],
+        [ { "node": "Google Sheets: Archive (COOL/COLD)", "type": "main", "index": 0 }, { "node": "Respond to Webhook", "type": "main", "index": 0 } ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "instanceId": "interactly-gtm-engine" },
+  "tags": [{ "name": "healthcare-gtm" }, { "name": "lead-scoring" }, { "name": "routing" }]
+}

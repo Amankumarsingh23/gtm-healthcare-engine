@@ -1,1 +1,200 @@
-{}
+{
+  "name": "Healthcare Signal Detection Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 6 }]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Schedule Trigger (Every 6h)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "notes": "Runs signal detection every 6 hours during business hours"
+    },
+    {
+      "parameters": {
+        "url": "https://news.google.com/rss/search?q=%22prior+authorization%22+OR+%22clinic+expansion%22+OR+%22healthcare+automation%22+OR+%22revenue+cycle%22+hiring&hl=en-US&gl=US&ceid=US:en",
+        "options": {}
+      },
+      "id": "rss-google-alerts",
+      "name": "Google News RSS - Healthcare Signals",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [480, 160],
+      "notes": "Monitors Google News for healthcare admin pain signals: prior auth issues, clinic expansions, RCM hiring"
+    },
+    {
+      "parameters": {
+        "url": "https://news.google.com/rss/search?q=%22new+clinic+opening%22+OR+%22medical+group+expansion%22+OR+%22healthcare+hiring+surge%22&hl=en-US&gl=US&ceid=US:en",
+        "options": {}
+      },
+      "id": "rss-expansion-signals",
+      "name": "Google News RSS - Expansion Signals",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [480, 340],
+      "notes": "Monitors for clinic expansion signals - new locations, mergers, growth announcements"
+    },
+    {
+      "parameters": {
+        "url": "https://news.google.com/rss/search?q=%22EHR+migration%22+OR+%22Epic+implementation%22+OR+%22Cerner+contract%22+OR+%22athenahealth+switch%22&hl=en-US&gl=US&ceid=US:en",
+        "options": {}
+      },
+      "id": "rss-ehr-signals",
+      "name": "Google News RSS - EHR Migration Signals",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1,
+      "position": [480, 520],
+      "notes": "Detects EHR migration/switching events - orgs in transition are open to new tooling"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and deduplicate signals from all RSS sources\nconst allItems = $input.all();\nconst seen = new Set();\nconst signals = [];\n\nfor (const item of allItems) {\n  const title = item.json.title || '';\n  const link = item.json.link || '';\n  const pubDate = item.json.pubDate || '';\n  \n  // Deduplicate by title similarity\n  const titleKey = title.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 50);\n  if (seen.has(titleKey)) continue;\n  seen.add(titleKey);\n  \n  // Classify signal type\n  let signalType = 'general';\n  let signalStrength = 'low';\n  const titleLower = title.toLowerCase();\n  \n  if (titleLower.includes('prior auth') || titleLower.includes('revenue cycle') || titleLower.includes('hiring')) {\n    signalType = 'pain_signal';\n    signalStrength = 'high';\n  } else if (titleLower.includes('expansion') || titleLower.includes('new location') || titleLower.includes('opens')) {\n    signalType = 'expansion';\n    signalStrength = 'high';\n  } else if (titleLower.includes('ehr') || titleLower.includes('epic') || titleLower.includes('cerner') || titleLower.includes('migration')) {\n    signalType = 'ehr_migration';\n    signalStrength = 'medium';\n  } else if (titleLower.includes('automation') || titleLower.includes('ai') || titleLower.includes('digital')) {\n    signalType = 'tech_adoption';\n    signalStrength = 'medium';\n  }\n  \n  // Extract organization name (heuristic: first proper noun phrase)\n  const orgMatch = title.match(/([A-Z][a-zA-Z]+(?:\\s+[A-Z][a-zA-Z]+){0,4})\\s+(?:Health|Medical|Clinic|Hospital|Group|Care|Partners)/i);\n  const orgName = orgMatch ? orgMatch[0] : 'NEEDS_MANUAL_REVIEW';\n  \n  signals.push({\n    json: {\n      signal_id: `SIG-${Date.now()}-${signals.length}`,\n      org_name: orgName,\n      signal_type: signalType,\n      signal_strength: signalStrength,\n      headline: title,\n      source_url: link,\n      detected_at: new Date().toISOString(),\n      published_at: pubDate,\n      status: 'new'\n    }\n  });\n}\n\nreturn signals;"
+      },
+      "id": "parse-classify",
+      "name": "Parse & Classify Signals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 340],
+      "notes": "Deduplicates signals, classifies by type (pain/expansion/EHR migration/tech adoption), extracts org names, assigns signal strength"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.signal_strength }}",
+              "rightValue": "high",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "leftValue": "={{ $json.signal_strength }}",
+              "rightValue": "medium",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "filter-quality",
+      "name": "Filter: Medium+ Signals Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [980, 340],
+      "notes": "Drops low-quality signals to avoid wasting Clay enrichment credits"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.clay.com/v3/sources/webhook/{{ $env.CLAY_WEBHOOK_ID }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{ $env.CLAY_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "org_name", "value": "={{ $json.org_name }}" },
+            { "name": "signal_type", "value": "={{ $json.signal_type }}" },
+            { "name": "signal_strength", "value": "={{ $json.signal_strength }}" },
+            { "name": "headline", "value": "={{ $json.headline }}" },
+            { "name": "source_url", "value": "={{ $json.source_url }}" },
+            { "name": "detected_at", "value": "={{ $json.detected_at }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "clay-enrich-trigger",
+      "name": "Push to Clay for Enrichment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 220],
+      "notes": "Sends signal to Clay table via webhook. Clay then runs waterfall enrichment: firmographics, technographics, contact mapping, pain indicators."
+    },
+    {
+      "parameters": {
+        "resource": "channel",
+        "operation": "post",
+        "channel": {
+          "__rl": true,
+          "value": "{{ $env.SLACK_SIGNALS_CHANNEL }}",
+          "mode": "id"
+        },
+        "text": ":rotating_light: *New Healthcare Signal Detected*\n\n*Org:* {{ $json.org_name }}\n*Type:* {{ $json.signal_type }} ({{ $json.signal_strength }})\n*Headline:* {{ $json.headline }}\n*Source:* {{ $json.source_url }}\n*Detected:* {{ $json.detected_at }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Slack: Signal Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1200, 460],
+      "notes": "Posts real-time signal alert to #gtm-signals Slack channel for founder visibility"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "{{ $env.GSHEET_SIGNAL_LOG }}", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Signals", "mode": "name" },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        },
+        "options": {}
+      },
+      "id": "gsheet-log",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1200, 340],
+      "notes": "Appends every signal to a master Google Sheet for tracking, reporting, and feedback loop analysis"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (Every 6h)": {
+      "main": [[
+        { "node": "Google News RSS - Healthcare Signals", "type": "main", "index": 0 },
+        { "node": "Google News RSS - Expansion Signals", "type": "main", "index": 0 },
+        { "node": "Google News RSS - EHR Migration Signals", "type": "main", "index": 0 }
+      ]]
+    },
+    "Google News RSS - Healthcare Signals": {
+      "main": [[ { "node": "Parse & Classify Signals", "type": "main", "index": 0 } ]]
+    },
+    "Google News RSS - Expansion Signals": {
+      "main": [[ { "node": "Parse & Classify Signals", "type": "main", "index": 0 } ]]
+    },
+    "Google News RSS - EHR Migration Signals": {
+      "main": [[ { "node": "Parse & Classify Signals", "type": "main", "index": 0 } ]]
+    },
+    "Parse & Classify Signals": {
+      "main": [[ { "node": "Filter: Medium+ Signals Only", "type": "main", "index": 0 } ]]
+    },
+    "Filter: Medium+ Signals Only": {
+      "main": [[
+        { "node": "Push to Clay for Enrichment", "type": "main", "index": 0 },
+        { "node": "Log to Google Sheets", "type": "main", "index": 0 },
+        { "node": "Slack: Signal Alert", "type": "main", "index": 0 }
+      ]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "interactly-gtm-engine"
+  },
+  "tags": [
+    { "name": "healthcare-gtm" },
+    { "name": "signal-detection" },
+    { "name": "interactly" }
+  ]
+}
